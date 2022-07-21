@@ -41,6 +41,9 @@ function process_package() {
         echo " -> Updating:" "$PKG"
         cp "$TEMP" "$PKGBUILD"
     fi
+    (cd "$PKG" &&
+        [[ .SRCINFO -nt PKGBUILD ]] ||
+        makepkg --printsrcinfo >.SRCINFO)
     echo
 }
 
