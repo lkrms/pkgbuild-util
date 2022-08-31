@@ -13,6 +13,9 @@ function message() {
     echo "$1" >&2
 }
 
+[[ ! -r ${LK_BASE-/opt/lk-platform}/etc/lk-platform/lk-platform.conf ]] ||
+    . "${LK_BASE-/opt/lk-platform}/etc/lk-platform/lk-platform.conf" || exit
+
 ARGS=(
     --noconfirm
     --remove
@@ -21,6 +24,7 @@ ARGS=(
 )
 [[ -z ${GPGKEY+1} ]] || ARGS+=(--sign)
 [[ -z ${CCACHE_DIR+1} ]] || ARGS+=(--bind-rw "$CCACHE_DIR:/build/.ccache")
+[[ -z ${LK_ARCH_AUR_CHROOT_DIR:+1} ]] || ARGS+=(--directory "$LK_ARCH_AUR_CHROOT_DIR")
 
 PREPARE=0
 ALL=0
