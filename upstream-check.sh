@@ -14,12 +14,18 @@
 
 set -euo pipefail
 
+function run() {
+    local IFS=$' \t\n'
+    echo " -> Running: $*" >&2
+    "$@"
+}
+
 DOTNET_ENDPOINT=https://dotnetcli.blob.core.windows.net/dotnet/release-metadata/releases-index.json
 
 function dotnet-core-bin() {
     local RELEASE
     RELEASE=($(
-        curl -fsSL "$DOTNET_ENDPOINT" |
+        run curl -fsSL "$DOTNET_ENDPOINT" |
             jq -r --arg channel_version "$1" '
 .["releases-index"][] | select( .["channel-version"] == $channel_version ) |
   ( .["releases.json"],
@@ -27,7 +33,7 @@ function dotnet-core-bin() {
     (.["latest-release"] + ".sdk" + ( .["latest-sdk"] | split(".") | last )))'
     )) || return
     printf 'pkgver=%q\n' "${RELEASE[2]}"
-    curl -fsSL "${RELEASE[0]}" |
+    run curl -fsSL "${RELEASE[0]}" |
         jq -r --arg release_version "${RELEASE[1]}" '
 .releases[] | select( .["release-version"] == $release_version ).sdk.files[] |
   ( select(.name == "dotnet-sdk-linux-x64.tar.gz") + {"arch": "x86_64"},
@@ -37,7 +43,7 @@ function dotnet-core-bin() {
 }
 
 function npmjs() {
-    curl -fsSL "https://registry.npmjs.org/$1/latest" |
+    run curl -fsSL "https://registry.npmjs.org/$1/latest" |
         jq -r '"pkgver=\(.version)"'
 }
 
@@ -65,9 +71,9 @@ function process_package() {
     fi
     (cd "$PKG" &&
         [[ .SRCINFO -nt PKGBUILD ]] ||
-        { { ((!UPDPKGSUMS)) || updpkgsums; } &&
-            makepkg --printsrcinfo >.SRCINFO ||
-            rm -f .SRCINFO; })
+        { { ((!UPDPKGSUMS)) || run updpkgsums; } &&
+            run makepkg --printsrcinfo >.SRCINFO ||
+            run rm -f .SRCINFO; })
     echo
 }
 

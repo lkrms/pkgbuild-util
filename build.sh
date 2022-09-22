@@ -13,6 +13,11 @@ function message() {
     echo "$1" >&2
 }
 
+function run() {
+    message " -> Running: $*"
+    "$@"
+}
+
 [[ ! -r ${LK_BASE-/opt/lk-platform}/etc/lk-platform/lk-platform.conf ]] ||
     . "${LK_BASE-/opt/lk-platform}/etc/lk-platform/lk-platform.conf" || exit
 
@@ -81,8 +86,8 @@ if ((PREPARE)); then
     while (($#)); do
         # Update pkgver and generate .SRCINFO
         (cd "$1" &&
-            makepkg --nodeps --noconfirm --nobuild &&
-            makepkg --printsrcinfo >.SRCINFO)
+            run makepkg --nodeps --noconfirm --nobuild &&
+            run makepkg --printsrcinfo >.SRCINFO)
         shift
     done
     exit
@@ -101,7 +106,7 @@ if (($# > 1)) && (($(printf '%s\n' "${@%/*}" | sort -u | wc -l) == 1)); then
     QUEUE=$(mktemp)
     cd "${1%/*}"
     aur graph "${@/%//.SRCINFO}" | tsort | tac >"$QUEUE"
-    aur build "${ARGS[@]}" --arg-file "$QUEUE"
+    run aur build "${ARGS[@]}" --arg-file "$QUEUE"
     rm -f "$QUEUE"
 else
     while (($#)); do
