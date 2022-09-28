@@ -47,6 +47,13 @@ function npmjs() {
         jq -r '"pkgver=\(.version)"'
 }
 
+function github() {
+    run curl -fsSL "https://api.github.com/repos/$1/$2/releases/latest" |
+        tee >(jq -r .body >"$NOTES") |
+        jq -r .tag_name |
+        sed -E 's/^[^0-9]*/pkgver=/'
+}
+
 # process_package [-u] PACKAGE COMMAND [ARG...]
 #
 # Run COMMAND and apply its output to the given package's PKGBUILD file.
@@ -60,7 +67,11 @@ function process_package() {
         exit 1
     }
     echo "==> Checking $PKG"
-    VAR=($("$@"))
+    VAR=($("$@")) &&
+        [[ -n ${VAR+1} ]] || {
+        echo " -> Update failed; skipping"
+        return
+    }
     awk -f "$AWK" "${VAR[@]}" <"$PKGBUILD" >"$TEMP"
     if "$DIFF" "$PKGBUILD" "$TEMP"; then
         echo " -> No update required"
@@ -68,6 +79,7 @@ function process_package() {
         echo
         echo " -> Updating:" "$PKG"
         cp "$TEMP" "$PKGBUILD"
+        cat "$NOTES"
     fi
     (cd "$PKG" &&
         [[ .SRCINFO -nt PKGBUILD ]] ||
@@ -121,6 +133,7 @@ in_val {
 EOF
 
 TEMP=$(mktemp)
+NOTES=$(mktemp)
 
 DIFF=icdiff
 type -P icdiff >/dev/null ||
@@ -141,6 +154,10 @@ for PKG in *; do
                 head -n1 |
                 grep .); then
                 process_package -u "$PKG" npmjs "$NPMJS"
+            elif [[ ${pkgname-} != *-git ]] &&
+                [[ ::${source-} == *::https://github.com/*/*/*${pkgver-}.tar.gz ]]; then
+                [[ $source =~ https://github.com/([^/]+)/([^/]+) ]]
+                process_package -u "$PKG" github "${BASH_REMATCH[@]:1:2}"
             else
                 echo "==> Not checked: $PKG"
                 echo
@@ -150,4 +167,4 @@ for PKG in *; do
     esac
 done
 
-rm -f "$TEMP" "$AWK"
+rm -f "$TEMP" "$AWK" "$NOTES"

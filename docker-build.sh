@@ -1,11 +1,12 @@
 #!/bin/bash
 
 # TODO:
-# - Add built packages to the repo
-# - Mount the repo in the container so it can be used to satisfy dependencies
-# - Sign packages
+# - [x] Add built packages to the repo
+# - [x] Mount the repo in the container so it can be used to satisfy dependencies
+# - [ ] Sign packages
 
 set -euo pipefail
+shopt -s nullglob extglob
 
 function die() {
     local s=$?
@@ -24,60 +25,58 @@ function run() {
 
 # get_dockerfile [PKGNAME]
 function get_dockerfile() {
-    local ARGS=(${MAKEPKG_ARGS+"${MAKEPKG_ARGS[@]}"} --syncdeps --noconfirm)
     cat <<"Dockerfile"
 # syntax=docker/dockerfile:1.4
 FROM archlinux:base-devel AS build
+ARG USER_ID
+ARG GROUP_ID
+ARG REPO=aur
 ARG MIRROR
 RUN <<EOF
+[ "${USER_ID:+1}${GROUP_ID:+1}" = 11 ] ||
+    { echo "Mandatory build arguments not set" >&2 && false || exit; }
+echo '%wheel ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/nopasswd-%wheel &&
+    groupadd -g "$GROUP_ID" build &&
+    useradd -u "$USER_ID" -g "$GROUP_ID" -mG wheel build &&
+    install -d -o build -g build /repo /package /pkg &&
+    runuser -u build -- repo-add "/repo/$REPO.db.tar.xz" >/dev/null 2>&1 &&
+    cat >>/etc/pacman.conf <<CONF &&
+[$REPO]
+SigLevel = Optional TrustAll
+Server = file:///repo
+CONF
+    install -Dm 0755 /dev/stdin /usr/local/bin/makepkg-wrapper <<"SH" &&
+#!/bin/sh
+
+sudo pacman -Syyu --noconfirm &&
+    makepkg "$@" &&
+    makepkg --packagelist | tr '\n' '\0' | xargs -0r -I '{}' mv -v '{}' /pkg/
+SH
 { [ -z "${MIRROR-}" ] || echo "$MIRROR" | tr , '\n' |
     sed 's/^/Server=/' >/etc/pacman.d/mirrorlist; } &&
     pacman -Syu --noconfirm &&
     { echo y && echo y; } | pacman -Scc &&
     printf '%s.UTF-8 UTF-8\n' en_AU en_GB en_US >/etc/locale.gen && locale-gen
 EOF
-RUN <<EOF
-echo '%wheel ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/nopasswd-%wheel &&
-    useradd -mG wheel build
-EOF
 ENV LANG=en_AU.UTF-8
 WORKDIR /package
-Dockerfile
-    if [[ -n ${1-} ]]; then
-        cat <<Dockerfile
-LABEL pkgname="$1"
-RUN ["install", "-d", "-o", "build", "-g", "build", "/package", "/pkg"]
 USER build
-COPY . /package
-RUN <<EOF
-makepkg ${ARGS[*]-} &&
-    makepkg --packagelist | tr '\n' '\0' | xargs -0r -I '{}' mv -v '{}' /pkg/
-EOF
-FROM scratch
-COPY --from=build /pkg /
-Dockerfile
-        return
-    fi
-    cat <<"Dockerfile"
-USER build
-ENTRYPOINT ["makepkg", "--noconfirm"]
-CMD ["--force", "--syncdeps"]
+ENTRYPOINT ["/usr/local/bin/makepkg-wrapper", "--noconfirm"]
+CMD ["--force", "--syncdeps", "--cleanbuild", "--clean"]
 Dockerfile
 }
 
-# docker_build [PKGNAME]
-function docker_build() {
-    local TAG
-    # Tag the "makepkg" image and leave others "dangling" (untagged) for easy
-    # removal
-    (($#)) || TAG=1
+# docker_build
+function docker_build() { (
+    CONTEXT=$(mktemp -d) &&
+        trap "run rm$(printf ' %q' -rf "$CONTEXT")" EXIT &&
+        cd "$CONTEXT" || exit
     run docker build \
         ${ARGS+"${ARGS[@]}"} \
         ${BUILD_ARGS+"${BUILD_ARGS[@]}"} \
-        ${TAG:+--tag="${1-makepkg}"} \
-        . -f - < <(get_dockerfile "$@" |
-            tee "/tmp/Dockerfile-${0##*/}.${1-makepkg}")
-}
+        --tag=makepkg \
+        . -f - < <(get_dockerfile)
+); }
 
 function docker_makepkg() {
     run docker run \
@@ -144,21 +143,35 @@ done
         done)
         ;;
     esac || {
-    message "Usage: ${0##*/} [--prepare] [--force] [--nocheck] [--all] <REPO> [PACKAGE...]"
+    message "Usage: ${0##*/} [--prepare] [--force] [--nocheck] [--all] <REPO>[:REPO_PATH] [PACKAGE...]"
     exit 1
 }
 
 (($#)) || die "nothing to build"
 
+if [[ $REPO == *:* ]]; then
+    SERVER=${REPO#*:}
+    REPO=${REPO%%:*}
+else
+    SERVER=$(pacman-conf -r "$REPO" Server 2>/dev/null |
+        sed -En 's/^file:\/\///p' | grep .) && [[ -d $SERVER ]] ||
+        die "unable to locate repo '$REPO' on filesystem"
+fi
+
+BUILD_ARGS+=(--build-arg "USER_ID=$(id -u)")
+BUILD_ARGS+=(--build-arg "GROUP_ID=$(id -g)")
+BUILD_ARGS+=(--build-arg "REPO=$REPO")
+
 message "==> ${VERB:-Building}:$(printf -- '\n  - %s' "$@")"
 
 export DOCKER_BUILDKIT=1
 
+docker_build
+
 if ((PREPARE)); then
-    docker_build
     while (($#)); do
         # Update pkgver and generate .SRCINFO
-        (cd "$1" && ARGS+=(--volume "$PWD:/package") &&
+        (cd "$1" && ARGS+=(--mount "type=bind,source=$PWD,target=/package") &&
             docker_makepkg --nodeps --nobuild --cleanbuild --clean &&
             docker_makepkg --printsrcinfo >.SRCINFO)
         shift
@@ -169,12 +182,19 @@ fi
 while (($#)); do
     (cd "$1" &&
         PKG=$(mktemp -d "$PWD/.${0##*/}.XXXXXXXX") &&
-        SH=$(. ./PKGBUILD && declare -p pkgname) && eval "$SH" &&
-        { [[ -f .dockerignore ]] ||
-            { trap "run rm$(printf ' %q' -f "$PWD/.dockerignore")" EXIT &&
-                printf '%s\n' /.git /pkg/ /src/ >.dockerignore; }; } &&
-        BUILD_ARGS+=(--output "$PKG") &&
-        docker_build "$pkgname")
+        trap "run rm$(printf ' %q' -rf "$PKG")" EXIT &&
+        ARGS+=(
+            --mount "type=bind,source=$PWD,target=/package"
+            --mount "type=bind,source=$PKG,target=/pkg"
+            --mount "type=bind,source=$SERVER,target=/repo"
+        ) &&
+        docker_makepkg &&
+        cd "$PKG" &&
+        ASSETS=(!(*.sig)) &&
+        { [[ -n ${ASSETS+1} ]] || die "no assets generated"; } &&
+        mv -vf -- * "${SERVER%/}/" &&
+        cd "$SERVER" &&
+        repo-add -R "$REPO.db.tar.xz" "${ASSETS[@]}")
     shift
 done
 
