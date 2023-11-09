@@ -1,17 +1,5 @@
 #!/bin/bash
 
-# For example, `dotnet-core-bin 3.1` currently generates the following output,
-# which `process_package` uses to update `dotnet-core-3.1-bin/PKGBUILD`:
-#
-#     pkgver=3.1.28.sdk422
-#     source_armv7h=('https://download.visualstudio.microsoft.com/download/pr/e5ec7845-008a-4b7d-a247-c314f2407b8d/9117e05fa19f0217a030666df6b6eb9d/dotnet-sdk-3.1.422-linux-arm.tar.gz')
-#     sha512sums_armv7h=('9cbccaf303f693657f797ae81eec2bd2ea55975b7ae71a8add04175a0104545208fa2f9c536b97d91fa48c6ea890678eb0772a448977bce4acbc97726ac47f83')
-#     source_aarch64=('https://download.visualstudio.microsoft.com/download/pr/fdf76122-e9d5-4f66-b96f-4dd0c64e5bea/d756ca70357442de960db145f9b4234d/dotnet-sdk-3.1.422-linux-arm64.tar.gz')
-#     sha512sums_aarch64=('3eb7e066568dfc0135f2b3229d0259db90e1920bb413f7e175c9583570146ad593b50ac39c77fb67dd3f460b4621137f277c3b66c44206767b1d28e27bf47deb')
-#     source_x86_64=('https://download.visualstudio.microsoft.com/download/pr/4fd83694-c9ad-487f-bf26-ef80f3cbfd9e/6ca93b498019311e6f7732717c350811/dotnet-sdk-3.1.422-linux-x64.tar.gz')
-#     sha512sums_x86_64=('690759982b12cce7a06ed22b9311ec3b375b8de8600bd647c0257c866d2f9c99d7c9add4a506f4c6c37ef01db85c0f7862d9ae3de0d11e9bec60958bd1b3b72c')
-#
-
 set -euo pipefail
 
 function run() {
@@ -22,6 +10,7 @@ function run() {
 
 DOTNET_ENDPOINT=https://dotnetcli.blob.core.windows.net/dotnet/release-metadata/releases-index.json
 
+# dotnet-core-bin <channel-version>
 function dotnet-core-bin() {
     local RELEASE
     RELEASE=($(
@@ -36,22 +25,91 @@ function dotnet-core-bin() {
     run curl -fsSL "${RELEASE[0]}" |
         jq -r --arg release_version "${RELEASE[1]}" '
 .releases[] | select( .["release-version"] == $release_version ).sdk.files[] |
-  ( select(.name == "dotnet-sdk-linux-x64.tar.gz") + {"arch": "x86_64"},
-    select(.name == "dotnet-sdk-linux-arm.tar.gz") + {"arch": "armv7h"},
+  ( select(.name == "dotnet-sdk-linux-x64.tar.gz")   + {"arch": "x86_64"},
+    select(.name == "dotnet-sdk-linux-arm.tar.gz")   + {"arch": "armv7h"},
     select(.name == "dotnet-sdk-linux-arm64.tar.gz") + {"arch": "aarch64"} ) |
   ( "source_\(.arch)=(\(.url | @sh))", "sha512sums_\(.arch)=(\(.hash | @sh))")'
 }
 
+# npmjs <package>
 function npmjs() {
     run curl -fsSL "https://registry.npmjs.org/$1/latest" |
-        jq -r '"pkgver=\(.version)"'
+        jq '
+{ "pkgver": .version,
+  "pkgdesc": .description,
+  "url": .homepage }' |
+        json_to_sh
 }
 
-function github() {
-    run curl -fsSL "https://api.github.com/repos/$1/$2/releases/latest" |
+# pypi <package>
+function pypi() {
+    run curl -fsS "https://pypi.org/pypi/$1/json" |
+        jq 'def e2n: if . == "" then null else . end;
+( .info + { "digests": [ .releases[.info.version][].digests ] } ) |
+  { "pkgver":     .version,
+    "pkgdesc":    .summary,
+    "url":        ((.project_urls.Homepage | e2n) // (.home_page | e2n) // .project_url),
+    "sha256sums": [ .digests[0].sha256 ] }' |
+        json_to_sh
+}
+
+# github_release <owner> <repo>
+function github_release() {
+    github_repo "$@" &&
+        github_curl "https://api.github.com/repos/$1/$2/releases/latest" |
         tee >(jq -r .body >"$NOTES") |
-        jq -r .tag_name |
-        sed -E 's/^[^0-9]*/pkgver=/'
+            jq -r .tag_name |
+            sed -E 's/^[^0-9]*/pkgver=/'
+}
+
+# github_tag <owner> <repo>
+function github_tag() {
+    github_repo "$@" &&
+        github_curl "https://api.github.com/repos/$1/$2/tags" |
+        jq -r '.[].name' |
+            sort -V |
+            sed -En 's/^v?([0-9]+(\.[0-9]+){1,2})$/pkgver=\1/p' |
+            tail -n1
+}
+
+# adobe-fonts <owner> <repo>
+function adobe-fonts() {
+    github_repo "$@" &&
+        github_curl "https://api.github.com/repos/$1/$2/releases/latest" |
+        tee >(jq -r .body >"$NOTES") |
+            jq -r .tag_name |
+            awk '
+{ print "_relver=" $0
+  gsub(/\//, "+")
+  print "pkgver=" tolower($0) }' |
+            sed -E '2s/(=|\+)([0-9]+\.[0-9]+)r?-?/\1\2/g'
+}
+
+# github_repo <owner> <repo>
+function github_repo() {
+    github_curl "https://api.github.com/repos/$1/$2" | jq '
+{ "pkgdesc": .description,
+  "url": (if (.homepage // "") != "" then .homepage else .html_url end) }' |
+        json_to_sh
+}
+
+function github_curl() {
+    run curl -fsS ${GITHUB_TOKEN:+-H @-} "$@" \
+        <<<"${GITHUB_TOKEN:+"Authorization: Bearer $GITHUB_TOKEN"}"
+}
+
+function json_to_sh() {
+    jq -r '
+to_entries[] | "\(.key)=\(
+  if .value | type == "array" then
+    [ .value[] | gsub("'\''"; "'\''\\'\'''\''")] |
+      "('\''" + join("'\'' '\''") + "'\'')"
+  elif .value | test("[^a-z0-9+./@_-]"; "i") then
+    .value | "\"" + gsub("(?<special>[\"$`])"; "\\\(.special)") + "\""
+  else
+    .value
+  end
+)"'
 }
 
 # process_package [-u] PACKAGE COMMAND [ARG...]
@@ -59,112 +117,167 @@ function github() {
 # Run COMMAND and apply its output to the given package's PKGBUILD file.
 function process_package() {
     local UPDPKGSUMS=0
-    [[ ${1-} != -u ]] || { UPDPKGSUMS=1 && shift; }
-    local IFS=$'\n' PKG=$1 PKGBUILD=$1/PKGBUILD VAR
+    [[ $1 != -u ]] || { UPDPKGSUMS=1 && shift; }
+
+    local IFS=$'\n' PKG=$1 PKGBUILD=$1/PKGBUILD VAR OUTDATED=0 REPLACE=0 DIRTY=0
     shift
-    [[ -f $PKGBUILD ]] || {
-        echo "File not found: $PKGBUILD" >&2
-        exit 1
-    }
+
     echo "==> Checking $PKG"
-    VAR=($("$@")) &&
-        [[ -n ${VAR+1} ]] || {
-        echo " -> Update failed; skipping"
-        return
-    }
-    awk -f "$AWK" "${VAR[@]}" <"$PKGBUILD" >"$TEMP"
-    if "$DIFF" "$PKGBUILD" "$TEMP"; then
-        echo " -> No update required"
-    else
+    : >"$NOTES"
+
+    if ((!OFFLINE)) && VAR=($("$@")) && [[ -n ${VAR+1} ]]; then
+        if is_outdated "$PKGBUILD" "${VAR[@]}"; then
+            VAR+=("pkgrel=1")
+            OUTDATED=1
+        else
+            VAR+=("pkgrel=$((${pkgrel:-0} + 1))")
+        fi
+        if ((FORCE || OUTDATED)); then
+            "$_DIR/update-PKGBUILD.awk" "${VAR[@]}" <"$PKGBUILD" >"$TEMP" || return
+            "$DIFF" "$PKGBUILD" "$TEMP" || REPLACE=1
+        fi
+    elif ((!OFFLINE)); then
+        echo " -> Update failed"
+    fi
+
+    if ((!REPLACE)) &&
+        { { PAGER="cat" git -C "$PKG" "$DIFF" PKGBUILD | grep .; } ||
+            { PAGER="cat" git -C "$PKG" "$DIFF" --staged PKGBUILD | grep .; }; }; then
+        DIRTY=1
+    fi
+
+    if ((REPLACE)); then
         echo
         echo " -> Updating:" "$PKG"
         cp "$TEMP" "$PKGBUILD"
+    elif ((DIRTY)); then
+        echo
+        echo " -> Uncommitted changes:" "$PKG"
+    else
+        echo " -> Already up to date:" "$PKG"
+    fi
+
+    if ((REPLACE || DIRTY)) && [[ -s $NOTES ]]; then
+        echo
+        echo "==> Release notes:"
+        echo
         cat "$NOTES"
     fi
+
+    if ((REPLACE || DIRTY)); then
+        echo "$PKG" >>"$PENDING"
+    fi
+
     (cd "$PKG" &&
         [[ .SRCINFO -nt PKGBUILD ]] ||
         { { ((!UPDPKGSUMS)) || run updpkgsums; } &&
             run makepkg --printsrcinfo >.SRCINFO ||
             run rm -f .SRCINFO; })
+
     echo
 }
 
-AWK=$(mktemp)
-cat >"$AWK" <<"EOF"
-BEGIN {
-  for (i = 1; i < ARGC; i++) {
-    if (split(ARGV[i], a, /=/) && a[1]) {
-        sub(/^[^=]+=/, "", ARGV[i])
-        val[a[1]]=ARGV[i]
-        ARGV[i]=""
-    }
-  }
-  FS="="
-}
-!in_val && /^[^ \t=]+=([^(]|(\(.*\))?[ \t]*$)/ && val[$1] {
-    print $1 "=" val[$1]
-    val[$1]=""
-    next
-}
-!in_val && /^[^ \t=]+=\((.*[^ \t)])?[ \t]*$/ {
-    in_val=$1
-    in_val_lines=$0
-    next
-}
-in_val && /\)[ \t]*$/ {
-    if (val[in_val]) {
-        print in_val "=" val[in_val]
-        val[in_val] = ""
-    } else {
-        print in_val_lines
-        print
-    }
-    in_val = ""
-    next
-}
-in_val {
-    in_val_lines = in_val_lines "\n" $0
-    next
-}
-{
-    print
-    next
-}
-EOF
+# is_outdated PKGBUILD <option>=<value>...
+function is_outdated() (
+    . "$1" && shift || exit
+    IFS=$'\n'
+    oldpkgver=${pkgver-}
+    unset pkgver
+    eval "$*" &&
+        [[ -n ${pkgver+1} ]] &&
+        [[ $pkgver != "$oldpkgver" ]]
+)
+
+OFFLINE=0
+FORCE=0
+while [[ ${1-} == -* ]]; do
+    case "$1" in
+    --offline)
+        OFFLINE=1
+        ;;
+    --force)
+        FORCE=1
+        ;;
+    *)
+        echo "Invalid argument: $1"
+        exit 1
+        ;;
+    esac
+    shift
+done
+
+_DIR=$(realpath "${BASH_SOURCE[0]}")
+_DIR=${_DIR%/*}
 
 TEMP=$(mktemp)
 NOTES=$(mktemp)
+PENDING=$(mktemp)
 
 DIFF=icdiff
 type -P icdiff >/dev/null ||
     DIFF="diff"
 
-for PKG in *; do
-    [[ -d $PKG ]] || continue
-    case "$PKG" in
-    dotnet-core-3.1-bin)
-        process_package "$PKG" dotnet-core-bin 3.1
-        ;;
-    *)
-        if [[ -f $PKG/PKGBUILD ]]; then (
-            set +u
-            . "$PKG/PKGBUILD"
-            if NPMJS=$(printf '%s\n' ${source+"${source[@]}"} |
-                sed -En 's@.*://registry\.npmjs\.org/([^/]+(/[^/]+)?)/-/.*@\1@p' |
-                head -n1 |
-                grep .); then
-                process_package -u "$PKG" npmjs "$NPMJS"
-            elif [[ ${pkgname-} != *-git ]] &&
-                [[ ::${source-} == *::https://github.com/*/*/*${pkgver-}.tar.gz ]]; then
-                [[ $source =~ https://github.com/([^/]+)/([^/]+) ]]
-                process_package -u "$PKG" github "${BASH_REMATCH[@]:1:2}"
-            else
-                echo "==> Not checked: $PKG"
-                echo
-            fi
-        ); fi
-        ;;
-    esac
-done
+(($#)) ||
+    set -- *
 
-rm -f "$TEMP" "$AWK" "$NOTES"
+for PKG in "$@"; do (
+
+    if [[ ! -f $PKG/PKGBUILD ]]; then
+        exit
+    fi
+
+    set +u
+
+    . "$PKG/PKGBUILD"
+
+    if [[ ${pkgname-} == *-git ]]; then
+        exit
+    fi
+
+    python_pkgname=${pkgname#python-}
+
+    if [[ $pkgbase == dotnet-core-3.1-bin ]]; then
+
+        process_package "$PKG" dotnet-core-bin 3.1
+
+    elif [[ ${source-} == *://registry.npmjs.org/*/-/* ]]; then
+
+        package=${source#*://registry.npmjs.org/}
+        package=${package%/-/*}
+        process_package -u "$PKG" npmjs "$package"
+
+    elif [[ ::${source-} == *::https://files.pythonhosted.org/packages/source/${python_pkgname::1}/${python_pkgname}/${python_pkgname}-${pkgver}.tar.gz ]]; then
+
+        process_package "$PKG" pypi "$python_pkgname"
+
+    elif [[ ::${source-} == *::https://github.com/*/*/*${pkgver-}.tar.gz ]]; then
+
+        [[ $source =~ https://github.com/([^/]+)/([^/]+) ]]
+        process_package -u "$PKG" github_release "${BASH_REMATCH[@]:1:2}"
+
+    elif [[ ::${source-} == *::git+https://github.com/*/*#tag=*${pkgver-} ]]; then
+
+        [[ $source =~ git\+https://github.com/([^/]+)/([^/]+)\.git ]]
+        process_package -u "$PKG" github_tag "${BASH_REMATCH[@]:1:2}"
+
+    elif [[ -n ${_relver-} ]] && [[ ::${source-} == *::https://github.com/adobe-fonts/*/*${_relver}.tar.gz ]]; then
+
+        [[ $source =~ https://github.com/([^/]+)/([^/]+) ]]
+        process_package -u "$PKG" adobe-fonts "${BASH_REMATCH[@]:1:2}"
+
+    else
+
+        echo "==> Not checked: $PKG"
+        echo
+
+    fi
+
+); done
+
+[[ ! -s $PENDING ]] || {
+    echo "==> Packages with uncommitted changes:"
+    cat "$PENDING"
+    echo
+}
+
+rm -f "$TEMP" "$NOTES" "$PENDING"

@@ -39,7 +39,7 @@ echo '%wheel ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/nopasswd-%wheel &&
     groupadd -g "$GROUP_ID" build &&
     useradd -u "$USER_ID" -g "$GROUP_ID" -mG wheel build &&
     install -d -o build -g build /repo /package /pkg &&
-    runuser -u build -- repo-add "/repo/$REPO.db.tar.xz" >/dev/null 2>&1 &&
+    runuser -u build -- repo-add "/repo/$REPO.db.tar.xz" &&
     cat >>/etc/pacman.conf <<CONF &&
 [$REPO]
 SigLevel = Optional TrustAll
@@ -74,6 +74,7 @@ function docker_build() { (
     run docker build \
         ${ARGS+"${ARGS[@]}"} \
         ${BUILD_ARGS+"${BUILD_ARGS[@]}"} \
+        --progress=plain \
         --tag=makepkg \
         . -f - < <(get_dockerfile)
 ); }
